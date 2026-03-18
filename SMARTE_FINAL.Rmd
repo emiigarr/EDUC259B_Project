@@ -1,0 +1,284 @@
+---
+title: "SMARTE_FINAL"
+output: html_document
+---
+
+
+#### Load packages
+
+```{r}
+library(googledrive)
+library(psych) # for descriptives
+library(tidyverse)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(scales)
+library(knitr)
+library(tidytext)
+library(corrplot)
+library(FactoMineR)
+library(factoextra)
+library(gridExtra)
+library(mclust)
+library(ggrepel)
+library(ranger)
+```
+
+#### Access google drive to get files
+```{r}
+drive_auth()
+```
+
+```{r}
+# ID of parent folder
+drive_ls(path = as_id("1szhWdy3lHwFRDwwxv8IgF1NDq5fYn43I"))
+
+# Grab JV's merged Study3 x school data
+drive_download(file = as_id("1Gt7K-XIkHKzSjW-VxB2cvQyrL25hLZ-z"), path = "SMARTE_merged.csv", overwrite = TRUE)
+```
+
+```{r}
+JV_merged <- read.csv("SMARTE_merged.csv")
+```
+
+```{r}
+#Grabbing School Data
+
+drive_ls(path = as_id("1szhWdy3lHwFRDwwxv8IgF1NDq5fYn43I"))
+drive_download(file = as_id("12xVJ47voWUd3gI2VCdDRm-slzGGosnTA"), path = "SchoolData_1_3.csv", overwrite = TRUE)
+```
+
+```{r}
+school <- read.csv("SchoolData_1_3.csv")
+```
+
+```{r}
+# Study 3 data
+Study3 <- read_csv("SMARTE_Brazil3.csv")
+```
+
+```{r}
+# Grabbing Study 1 data
+drive_ls(path = as_id("1szhWdy3lHwFRDwwxv8IgF1NDq5fYn43I"))
+drive_download(file = as_id("105BRxj2sDnm56zZZRuk6n7rtLN91TRdt"), path = "Brazil_Study1.csv", overwrite = TRUE)
+```
+
+```{r}
+Study1 <- read.csv("Brazil_Study1.csv")
+```
+
+
+#### Merge Study 1 and school data
+```{r}
+# Making sure PIDs are characters to prevent merge errors
+Study1$pid <- as.character(Study1$pid)
+school$pid <- as.character(school$pid)
+
+# Merging to new dataframe
+Study1_X_school <- Study1 %>%
+  inner_join(school, by = "pid")
+
+# Checking to see total sample size
+length(unique(Study1_X_school$pid))
+```
+
+
+### Descriptive Analysis
+#### Looking into phases
+```{r}
+table(Study1_X_school$phase, useNA = "ifany")
+```
+
+#### Checking to see if NA is PhaseA (Enumeration), and it was
+```{r}
+Study1_X_school %>%
+  filter(is.na(phase)) %>%
+  select(Type, module) %>%
+  table()
+```
+
+#### Updating the phase names
+```{r}
+Study1_X_school <- Study1_X_school %>%
+  mutate(phase = case_when(
+    is.na(phase)    ~ "A",
+    phase == "TestA" ~ "B",
+    phase == "TestB" ~ "C",
+    phase == "TestC" ~ "D",
+    phase == "TestD" ~ "E",
+    TRUE            ~ as.character(phase)
+  ))
+```
+
+
+#### Finding optimal RT per phase
+```{r}
+# Creating new data frame to use for optimal reaction time per phase
+plot_data <- Study1_X_school %>%
+  filter(!is.na(Submit_RT), !is.na(correct)) %>%
+  mutate(Submit_RT_sec = Submit_RT / 1000) %>% #Converting into seconds
+  group_by(phase) %>%
+  mutate(Time_Bucket = ntile(Submit_RT_sec, 15)) %>%
+  group_by(phase, Time_Bucket) %>%
+  summarize(
+    Average_RT = mean(Submit_RT_sec, na.rm = TRUE),
+    Accuracy = mean(correct, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Create the optimal_lines data frame
+optimal_lines <- plot_data %>%
+  group_by(phase) %>%
+  slice_max(order_by = Accuracy, n = 1, with_ties = FALSE)
+
+# Plot
+ggplot(data = plot_data, aes(x = Average_RT, y = Accuracy)) +
+  geom_point(color = "#5DA5DA", size = 3, alpha = 0.8) +
+  geom_smooth(method = "loess", color = "mediumblue", se = FALSE) +
+  geom_vline(data = optimal_lines, aes(xintercept = Average_RT),
+             color = "red", linetype = "dashed", alpha = 0.6) +
+  geom_text(data = optimal_lines, 
+            aes(x = Average_RT, y = min(plot_data$Accuracy), 
+                label = paste("Optimal RT ≈", round(Average_RT, 2))),
+            color = "red", angle = 90, vjust = -1, hjust = 0) +
+  facet_wrap(~ phase, scales = "free_x") +
+  labs(title = "Speed-Accuracy Curves by Phase (Study 1)",
+       x = "Average Response Time (Seconds)",
+       y = "Accuracy") +
+  theme_bw()
+```
+
+
+```{r}
+# Formatting optimal_lines into a clean table we can look up later if we need to
+opt_lookup <- optimal_lines %>%
+  select(phase, Optimal_RT_sec = Average_RT) #Keeping only the phase and the optimal response time
+
+# Joining it to Study1_x_school dataset
+Study1_X_school <- Study1_X_school %>%
+  left_join(opt_lookup, by = "phase") %>% # Attaching the optimal times based on the phase
+
+# Calculating the distance from optimal (in seconds)  
+  mutate(
+    Submit_RT_sec = Submit_RT / 1000, # First converting the time to seconds
+    Distance_From_Optimal = abs(Submit_RT_sec - Optimal_RT_sec) # Then, calculating the absolute distance
+  )
+
+# Checking to see if it worked
+Study1_X_school %>%
+  select(phase, Submit_RT_sec, Optimal_RT_sec, Distance_From_Optimal) %>%
+  head()
+```
+
+
+
+### Looking at which school and characteristic variables could effect students to deviate from optimal response time by random forest
+
+```{r}
+# Preparing data for random forest
+rf_data_context <- Study1_X_school %>%
+  filter(phase != "E") %>% # Dropping Phase E since N=7 is too small
+  select(Distance_From_Optimal, GRADE, SES10, GENDER, Nervous_Level_Num) %>% # Selecting only the target and the predictors
+  na.omit() # Removing rows with missing data in these specific columns
+
+# Running the Random Forest
+set.seed(123) #for reproducability
+model_a_context <- ranger(
+  formula = Distance_From_Optimal ~ ., 
+  data = rf_data_context, 
+  importance = "permutation",
+  num.trees = 500
+)
+
+# Printing results
+print(sort(model_a_context$variable.importance, decreasing = TRUE))
+```
+
+
+### Visualizing importance scores
+```{r}
+# New dataframe 
+imp_model_a <- data.frame(
+  Feature = names(model_a_context$variable.importance),
+  Importance = as.numeric(model_a_context$variable.importance)
+)
+
+ggplot(imp_model_a, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "#5DA5DA", width = 0.7) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Feature importance scores", 
+    x = "Features", 
+    y = "Permutation Importance Score"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 12)
+  )
+```
+
+### Deeper analysis, looking into each feature
+#### GRADE first
+```{r}
+# Boxplots
+ggplot(Study1_X_school %>% 
+         filter(phase != "E"),
+       aes(x = as.factor(GRADE), y = Distance_From_Optimal, fill = as.factor(GRADE))) + #Treating GRADE as distinct categories rather than a continuous number
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.05) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14)
+  ) + 
+  coord_cartesian(ylim = c(0, 7)) + #Zooming in for 7 second limit for the test
+  labs(
+    title = "Student Grade Level Deviations from Optimal Response Time",
+    x = "Grade Level",
+    y = "Distance from Optimal RT (Seconds)"
+  )
+```
+
+#### SES 
+```{r}
+ggplot(Study1_X_school %>% 
+         filter(phase != "E"),
+       aes(x = as.factor(SES10), y = Distance_From_Optimal, fill = as.factor(SES10))) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.05) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14)
+  ) + 
+  coord_cartesian(ylim = c(0, 7)) + 
+  labs(
+    title = "SES Level Deviations from Optimal Response Time",
+    x = "SES Level",
+    y = "Distance from Optimal RT (Seconds)"
+  )
+```
+
+#### Nervous Level
+```{r}
+ggplot(Study1_X_school %>% 
+         filter(phase != "E"),
+       aes(x = as.factor(Nervous_Level_Num), y = Distance_From_Optimal, fill = as.factor(Nervous_Level_Num))) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.05) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14)
+  ) + 
+  coord_cartesian(ylim = c(0, 7)) + 
+  labs(
+    title = "Nervous Level Deviations from Optimal Response Time",
+    x = "Nervous Level",
+    y = "Distance from Optimal RT (Seconds)"
+  )
+```
+
+
+
+
+
